@@ -7,9 +7,14 @@ LangGraph构建有状态多轮LLM应用的革命性框架
 - [项目介绍](#项目介绍)
 - [核心架构设计](#核心架构设计)
 - [重点目录源码分析](#重点目录源码分析)
+- [核心执行机制深度分析](#核心执行机制深度分析)
 - [创新点](#创新点)
+- [与其他框架的比较](#与其他框架的比较)
 - [使用指南](#使用指南)
+- [调试和常见问题解决](#调试和常见问题解决)
+- [性能优化和扩展指南](#性能优化和扩展指南)
 - [可视化架构图](#可视化架构图)
+- [总结](#总结)
 
 ---
 
@@ -64,25 +69,25 @@ LangGraph的核心思想是将**LLM应用的执行过程建模为一个有向无
 ### 分层架构
 
 ```
-┌─────────────────────────────────────────────────────┐
-│         高层API (High-Level APIs)                  │
-│  StateGraph | CompiledStateGraph | create_react_agent
-└────────────┬────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────——┐
+│         高层API (High-Level APIs)                      │
+│  StateGraph | CompiledStateGraph | create_react_agent ｜
+└────────────┬────────────────────────────────────────——┘
              │
-┌─────────────┴────────────────────────────────────────┐
-│      核心引擎层 (Core Engine Layer)                 │
-│  Pregel | PregelLoop | SyncPregelLoop | AsyncPregelLoop
-└────────────┬────────────────────────────────────────┘
+┌─────────────┴──────────────────────────────────────—————┐
+│      核心引擎层 (Core Engine Layer)                       │
+│  Pregel | PregelLoop | SyncPregelLoop | AsyncPregelLoop ｜ 
+└────────────┬────────────────────────────────────────----┘
              │
-┌─────────────┴────────────────────────────────────────┐
+┌─────────────┴─────────────────────────────────────——┐
 │       算法层 (Algorithm Layer)                       │
 │  _algo.py: apply_writes | prepare_next_tasks        │
 │           local_read | should_interrupt             │
 └────────────┬────────────────────────────────────────┘
              │
-┌─────────────┴────────────────────────────────────────┐
-│      基础设施层 (Infrastructure Layer)              │
-│  Channels | Checkpoints | Store | Runtime            │
+┌────────────┴────────────────────────────────——──────┐
+│      基础设施层 (Infrastructure Layer)                │
+│  Channels | Checkpoints | Store | Runtime           │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -352,48 +357,6 @@ def stream(
             yield chunk
 ```
 
-**关键执行细节解析：**
-
-```python
-# 1. Config传递和设置
-config = ensure_config(config)
-config = {
-    "configurable": {
-        "thread_id": thread_id,        # 用于checkpoint持久化
-        "checkpoint_id": checkpoint_id, # 从哪个checkpoint恢复
-    }
-}
-
-# 2. Loop的职责分工
-# SyncPregelLoop/AsyncPregelLoop职责：
-#   - 管理完整的执行生命周期
-#   - 处理checkpoint的加载和保存
-#   - 管理executor的生命周期
-#   - 产生流输出
-
-# 3. 执行器(Executor)职责：
-#   - 根据BackgroundExecutor或AsyncBackgroundExecutor
-#   - 真正执行node函数
-#   - 收集执行结果（writes）
-#   - 处理重试和超时
-
-# 4. 流输出的生成
-# stream_mode="updates"时：
-yield {
-    "node_name": {
-        "key1": new_value1,
-        "key2": new_value2,
-    }
-}
-
-# stream_mode="values"时：
-yield {
-    "key1": current_value1,
-    "key2": current_value2,
-    "key3": current_value3,  # 所有state的当前值
-}
-```
-
 ---
 
 #### 2.2 算法核心：_algo.py - 任务调度和状态管理
@@ -629,56 +592,40 @@ class SyncPregelLoop(AbstractContextManager):
 
 **执行循环的详细流程：**
 
-```
-┌─────────────────────────────────────────────────────┐
-│  1. 加载或创建初始checkpoint                        │
-│     - 如果有checkpoint_id，从saver加载             │
-│     - 否则，创建空的checkpoint                     │
-└──────────────┬──────────────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────────────┐
-│  2. 应用输入到channels                             │
-│     - 将input转换为state                           │
-│     - 更新对应的channels                           │
-└──────────────┬──────────────────────────────────────┘
-               │
-        ┌──────▼───────┐
-        │   loop       │
-        │ ┌──────────┐ │
-        │ │ 3. 准备任│ │
-        │ │    务   │ │
-        │ └────┬─────┘ │
-        │      │       │
-        │ ┌────▼─────┐ │
-        │ │ 4. 检查  │ │
-        │ │ 中断     │ │
-        │ └────┬─────┘ │
-        │      │       │
-        │ ┌────▼─────┐ │
-        │ │ 5. 执行  │ │
-        │ │ 任务     │ │
-        │ └────┬─────┘ │
-        │      │       │
-        │ ┌────▼─────┐ │
-        │ │ 6. 应用  │ │
-        │ │ writes   │ │
-        │ └────┬─────┘ │
-        │      │       │
-        │ ┌────▼─────┐ │
-        │ │ 7. 产生  │ │
-        │ │ 输出     │ │
-        │ └────┬─────┘ │
-        │      │       │
-        │ ┌────▼──────────┐
-        │ │ 没有更多任务? │
-        │ │ 是 -> 退出   │
-        │ │ 否 -> 循环   │
-        │ └──────────────┘
-        └──────────────────┘
-               │
-┌──────────────▼──────────────────────────────────────┐
-│  8. 保存最终checkpoint并返回                        │
-└──────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["1. 加载或创建初始checkpoint<br/>(从saver或创建新的)"]
+    B["2. 应用输入到channels<br/>(input → state)"] 
+    C["3. 准备任务<br/>(prepare_next_tasks)"]
+    D{{"4. 有待执行的任务?"}}
+    E{{"5. 需要中断?"}}
+    F["中断: 让用户干预<br/>(yield interrupt)"]
+    G["6. 并发执行任务<br/>(ThreadPoolExecutor/asyncio)"]
+    H["7. 应用writes<br/>(apply_writes)"]
+    I["8. 产生输出<br/>(yield chunk)"]
+    J{{"9. 还有更多任务?"}}
+    K["10. 保存最终checkpoint<br/>并返回"]
+    
+    A --> B
+    B --> C
+    C --> D
+    D -->|是| E
+    D -->|否| K
+    E -->|是| F
+    E -->|否| G
+    F --> C
+    G --> H
+    H --> I
+    I --> J
+    J -->|是| C
+    J -->|否| K
+    
+    style A fill:#e3f2fd
+    style B fill:#e3f2fd
+    style C fill:#f3e5f5
+    style G fill:#e8f5e9
+    style H fill:#fff3e0
+    style K fill:#fce4ec
 ```
 
 2. **AsyncPregelLoop** - 异步执行循环
@@ -891,6 +838,166 @@ class StateSnapshot:
     next: list[str]         # 下一步要执行的节点
     config: RunnableConfig  # 运行时配置
     metadata: dict          # 元数据（时间戳等）
+```
+
+---
+
+## 核心执行机制深度分析
+
+### 任务执行和版本控制的完整流程
+
+LangGraph的精妙之处在于通过**版本化机制**实现了对循环图的精确控制。让我们深入分析其内部工作原理：
+
+#### 版本控制机制详解
+
+```python
+# 在Checkpoint中维护的版本信息结构
+Checkpoint = {
+    "ts": datetime,
+    "values": {
+        "channel_name": value,
+        ...
+    },
+    "channel_versions": {
+        "input": 1,         # 每个channel都有独立版本
+        "messages": 2,
+        "output": 3,
+    },
+    "versions_seen": {
+        "node_1": {"input": 1, "messages": 2},    # 节点看到的版本
+        "node_2": {"input": 1, "messages": 1},    # 节点看到的版本
+    },
+    "pending_writes": [],   # 待应用的写入
+}
+
+# 核心逻辑：节点何时被触发？
+# 答案：当节点的任何trigger_channel的版本 > versions_seen中记录的版本时
+#
+# 示例：
+# Step 1: node_1执行，更新channel_versions["messages"] = 2
+#         versions_seen["node_2"]["messages"] = 1 < 2 → node_2应该被触发
+# 
+# Step 2: node_2执行，读取消息版本2
+#         versions_seen["node_2"]["messages"] = 2
+#         即使messages再次更新为版本3，node_2仍会被触发（因为3 > 2）
+#
+# Step 3: 如果node_1再次更新messages为版本4
+#         versions_seen["node_1"]["messages"] = 2 < 4 → node_1被再次触发
+#         这就是"循环"的机制！
+```
+
+**这个设计的妙处：**
+
+1. ✅ **避免重复执行**：节点记住自己看过的版本，不会重复处理相同的版本
+2. ✅ **支持循环**：新的版本会重新触发节点，自然支持循环
+3. ✅ **确定性执行**：版本号严格单调递增，保证执行顺序确定
+4. ✅ **高效调度**：只比较版本号，比遍历整个状态快得多
+
+#### 任务执行的完整流程（带示例）
+
+```python
+# 假设图结构：
+#   input -> [process, validate] -> [combine] -> output
+#            (并行执行)
+
+# 初始化：
+checkpoint = {
+    "values": {"input": "hello", "messages": []},
+    "channel_versions": {"input": 1, "messages": 1},
+    "versions_seen": {
+        "process": {},
+        "validate": {},
+        "combine": {},
+    }
+}
+
+# Step 1: 从输入通道input出发
+# prepare_next_tasks找到的节点：
+#   - process (trigger="input", 未在versions_seen中)
+#   - validate (trigger="input", 未在versions_seen中)
+tasks = [
+    PregelExecutableTask(name="process", ...),
+    PregelExecutableTask(name="validate", ...)
+]
+
+# Step 2: 并行执行这两个任务
+# process执行结果：{"messages": ["processed"]}
+# validate执行结果：{"messages": ["validated"]}
+writes = [
+    ("process", [("messages", "processed")]),
+    ("validate", [("messages", "validated")]),
+]
+
+# Step 3: 应用writes
+# 关键：messages字段有reducer: lambda a,b: a+[b]
+# 执行顺序（按path排序）：
+#   current_messages = [] (初始)
+#   current_messages = reducer([], "processed") = ["processed"]
+#   current_messages = reducer(["processed"], "validated") = ["processed", "validated"]
+#
+# 更新versions：
+#   channel_versions["messages"] = 2 (从1递增)
+#
+# 更新versions_seen：
+#   versions_seen["process"]["input"] = 1
+#   versions_seen["validate"]["input"] = 1
+
+# Step 4: 检查下一步任务
+# combine节点的trigger是messages，版本从1变为2
+# versions_seen["combine"]["messages"] 不存在 or < 2
+# → combine应该被执行
+tasks = [
+    PregelExecutableTask(name="combine", ...)
+]
+
+# Step 5: 执行combine，最终输出
+```
+
+#### Checkpoint恢复的关键细节
+
+```python
+# 假设中断：
+# 1. graph在节点"process"中间中断
+# 2. checkpoint被保存，包含versions_seen信息
+
+# 恢复步骤：
+restored_checkpoint = checkpointer.get(thread_id, checkpoint_id)
+# → values已恢复
+# → channel_versions已恢复 
+# → versions_seen已恢复！（关键！）
+
+# 继续执行：
+# prepare_next_tasks会使用versions_seen来判断
+# 因为versions_seen已正确记录，所以：
+# - 已经执行过的节点不会重复执行
+# - 新接收到的更新会正确触发节点
+```
+
+**这就是LangGraph为什么能支持完整的故障恢复的原因！**
+
+### 条件分支的底层实现
+
+```python
+# 用户代码：
+def route_to_next(state: State) -> str:
+    if state["needs_llm"]:
+        return "llm_node"
+    else:
+        return "process_node"
+
+graph.add_conditional_edges(
+    source="decision",
+    path=route_to_next
+)
+
+# LangGraph内部实现：
+# 1. 执行decision节点，产生writes
+# 2. 应用writes到channels
+# 3. 调用route_to_next(state)获得下一个节点名
+# 4. 基于返回值，将对应的边添加到执行计划
+
+# 关键点：route函数可以读取"fresh"状态
+# 即：decision节点的输出立即用于决策，不需要等待版本更新
 ```
 
 ---
@@ -1591,271 +1698,199 @@ compiled.invoke(
 
 ---
 
-## 常见错误和调试指南
+## 调试和常见问题解决
 
-### 错误1：RuntimeError - "Not configured with a read function"
+### 常见错误和解决方案
 
-**错误信息：**
-```
-RuntimeError: Not configured with a read function
-Make sure to call in the context of a Pregel process
-```
+#### 问题 1：节点没有被执行
 
-**原因：**
-在节点外部调用了 `ChannelRead.do_read()` 或试图在非Pregel上下文中读取通道。
+**症状：** 定义了节点，但图执行时节点没有运行
 
-**解决方案：**
+**常见原因和解决：**
+
 ```python
-# ❌ 错误：直接在节点外读取
-state = channels["my_key"].get()
-
-# ✅ 正确：在节点内使用config提供的read函数
-def my_node(state: State, config: RunnableConfig) -> dict:
-    # 方法1：直接使用state
-    value = state["my_key"]
-    
-    # 方法2：使用fresh读取（包括当前node的writes）
-    from langgraph.pregel._read import ChannelRead
-    fresh_value = ChannelRead.do_read(
-        config,
-        select="my_key",
-        fresh=True
-    )
-    return {"output": value}
-```
-
-### 错误2：InvalidUpdateError - "Invalid update"
-
-**错误信息：**
-```
-InvalidUpdateError: Invalid update to channel "messages": expected list, got str
-```
-
-**原因：**
-节点返回的值类型与Channel的UpdateType不匹配。
-
-**解决方案：**
-```python
-# ❌ 错误：返回字符串而不是列表
-class State(TypedDict):
-    messages: Annotated[list[str], lambda a, b: a + [b]]
-
-def node(state) -> dict:
-    return {"messages": "new message"}  # 错误！期望是list
-
-# ✅ 正确：返回正确的类型
-def node(state) -> dict:
-    return {"messages": "new message"}  # 不需要包装成list，reducer会处理
-    # 或者
-    return {"messages": ["new message"]}  # 也可以返回list，reducer会聚合
-```
-
-### 错误3：EmptyChannelError - 通道为空
-
-**错误信息：**
-```
-EmptyChannelError: Channel 'query' is empty
-```
-
-**原因：**
-试图读取从未被写入过的通道。
-
-**解决方案：**
-```python
-# ❌ 错误：没有初始化某些通道
-graph = StateGraph(State)
+# ❌ 错误1：节点的trigger通道没有被更新
 graph.add_node("process", process_node)
-graph.set_entry_point("process")
+# 忘记添加边！
+# ✅ 应该：
+graph.add_edge("previous_node", "process")
 
-# invoke时没有提供所有必需的字段
-result = graph.invoke({})  # 缺少"query"字段
+# ❌ 错误2：节点读取的通道为空
+def process_node(state):
+    return {"result": state["input"]}  # input可能为空
 
-# ✅ 正确：提供所有必需的初始值
-result = graph.invoke({"query": "...", "results": []})
+# ✅ 检查方式：
+# 在调用节点前检查输入是否可用
+for chunk in graph.stream(input, stream_mode="debug"):
+    # 查看debug输出，确认状态值
 
-# 或者使用Optional字段
+# ❌ 错误3：条件分支错误返回节点名
+def route(state):
+    return "nonexistent_node"  # 这个节点不存在！
+
+# ✅ 验证节点存在：
+print(graph.nodes.keys())  # 检查已定义的节点
+```
+
+#### 问题 2：状态更新未按预期进行
+
+**症状：** 节点返回了数据，但状态没有更新
+
+**常见原因和解决：**
+
+```python
+# ❌ 错误1：返回了不正确的格式
+def my_node(state):
+    return {"input": "value"}  # 可能该字段没有在schema中定义
+
+# ✅ 检查state schema中的字段名
 class State(TypedDict):
-    query: str
+    my_field: str
     results: list[str]
-    optional_field: NotRequired[str]  # 可选字段
+
+# ❌ 错误2：Reducer未正确处理None值
+class State(TypedDict):
+    messages: Annotated[
+        list[str],
+        lambda a, b: a + [b]  # 如果b是None会失败！
+    ]
+
+# ✅ 正确的reducer：
+class State(TypedDict):
+    messages: Annotated[
+        list[str],
+        lambda a, b: a + [b] if b is not None else a
+    ]
+
+# ❌ 错误3：并发更新导致版本混乱
+# 如果两个节点同时修改同一个non-reducer字段
+# 最后执行的会覆盖前面的
+
+# ✅ 解决方案：
+# 对需要多节点修改的字段使用reducer：
+class State(TypedDict):
+    results: Annotated[list, lambda a, b: a + [b]]  # 聚合！
 ```
 
-### 错误4：GraphRecursionError - 递归深度超限
+#### 问题 3：中断和恢复不工作
 
-**错误信息：**
-```
-GraphRecursionError: Exceeded max recursion depth of 25
-```
+**症状：** 设置了interrupt_before但图没有中断
 
-**原因：**
-图中的节点执行次数超过了递归限制（默认25次）。
+**常见原因和解决：**
 
-**解决方案：**
 ```python
-# 问题可能是：
-# 1. 条件分支有死循环
-def should_continue(state):
-    # ❌ 错误：永远返回True，导致无限循环
-    return "search" if state["count"] < 100 else "end"
+# ❌ 错误1：没有设置checkpointer
+compiled = graph.compile()  # 没有checkpoint支持
 
-# 2. 忘记更新状态计数
-def search_node(state):
-    # ❌ 错误：没有更新count，导致无限循环
-    return {"results": search(state["query"])}
-
-# ✅ 正确：每次更新状态，逐步接近终止条件
-def search_node(state):
-    if state["search_count"] >= 3:
-        return {"final_answer": llm.generate(...)}
-    
-    results = search(state["query"])
-    return {
-        "results": results,
-        "search_count": state["search_count"] + 1
-    }
-
-# 或者增加递归限制
-compiled = graph.compile()
-result = compiled.invoke(
-    input_state,
-    config={"recursion_limit": 100}
-)
-```
-
-### 错误5：Checkpointer Not Configured
-
-**错误信息：**
-```
-AttributeError: 'NoneType' object has no attribute 'get'
-```
-
-**原因：**
-使用了 `get_state()` 或 `update_state()` 但没有提供checkpointer。
-
-**解决方案：**
-```python
+# ✅ 正确做法：
 from langgraph.checkpoint.memory import InMemorySaver
-
-# ❌ 错误：没有checkpointer
-compiled = graph.compile()
-state = compiled.get_state(config)  # 会失败
-
-# ✅ 正确：提供checkpointer
 checkpointer = InMemorySaver()
 compiled = graph.compile(checkpointer=checkpointer)
 
-# 现在可以使用状态管理功能
-state = compiled.get_state({"configurable": {"thread_id": "user_123"}})
-compiled.update_state(config, {"approved": True})
+# ❌ 错误2：使用了hidden节点
+# LangGraph自动跳过标记为hidden的节点
+# 这意味着即使指定interrupt_before=["hidden_node"]也不会中断
+
+# ✅ 检查节点是否有隐藏标记：
+for chunk in compiled.stream(
+    input,
+    interrupt_before=["my_node"]
+):
+    print(chunk)  # 如果没有中断，检查节点配置
+
+# ❌ 错误3：中断后没有正确继续执行
+config = {"configurable": {"thread_id": "user_1"}}
+for chunk in compiled.stream(input, config=config, interrupt_before=["review"]):
+    print(chunk)
+
+# 中断后需要重新调用stream，传入相同的config
+for chunk in compiled.stream(None, config=config):  # 继续执行
+    print(chunk)
 ```
 
 ### 调试技巧
 
-#### 1. **使用debug模式输出详细信息**
+#### 1. 使用debug stream mode
 
 ```python
-# 启用LangChain的debug模式
-import langchain
-langchain.debug = True
-
-# 执行图 - 会打印详细的追踪信息
-for chunk in compiled.stream(input):
-    print(chunk)
-
-# 或使用stream_mode="debug"获取结构化的调试信息
-for chunk in compiled.stream(input, stream_mode="debug"):
-    print(f"Type: {chunk[0]}, Name: {chunk[1]}, Data: {chunk[2]}")
-```
-
-#### 2. **检查状态历史**
-
-```python
-config = {"configurable": {"thread_id": "debug_session"}}
-
-# 执行图
-result = compiled.invoke(input, config=config)
-
-# 查看所有checkpoint
-for snapshot in compiled.get_state_history(config):
-    print(f"Step: {snapshot.metadata.get('step')}")
-    print(f"Values: {snapshot.values}")
-    print(f"Next nodes: {snapshot.next}")
-    print("---")
-```
-
-#### 3. **手动逐步执行和修改**
-
-```python
-config = {"configurable": {"thread_id": "manual_debug"}}
-
-# 第一步：执行直到某个节点
-for chunk in compiled.stream(
+# 打印详细的执行信息
+for chunk in graph.stream(
     input,
-    config=config,
-    interrupt_before=["llm_node"]
+    stream_mode="debug"
 ):
-    print(f"Chunk: {chunk}")
-
-# 检查当前状态
-state = compiled.get_state(config)
-print(f"Current state: {state.values}")
-print(f"Next nodes: {state.next}")
-
-# 修改状态后继续
-compiled.update_state(config, {
-    "user_feedback": "修改后的值"
-})
-
-# 继续执行
-for chunk in compiled.stream(None, config=config):
-    print(f"Resumed: {chunk}")
+    print(chunk)
+    # 输出格式：
+    # {
+    #   "type": "task_start" | "task_end",
+    #   "node": "node_name",
+    #   "timestamp": ...,
+    #   "input": ...,
+    #   "output": ...,
+    #   "duration": ...
+    # }
 ```
 
-#### 4. **查看图的结构**
+#### 2. 获取和检查状态快照
 
 ```python
-# 获取图的可视化
-graph = compiled.get_graph()
+# 在执行中获取当前状态
+config = {"configurable": {"thread_id": "user_1"}}
 
-# 导出为图片（需要graphviz）
-graph.draw_png("graph.png")
+# 执行一部分
+for chunk in graph.stream(input, config=config, interrupt_before=["node_2"]):
+    pass
 
-# 或者打印文本表示
-print(graph)
+# 获取当前状态
+state = graph.get_state(config)
+print(f"Current values: {state.values}")
+print(f"Next nodes to run: {state.next}")
 
-# 获取节点和边的详细信息
-print(f"Nodes: {graph.nodes}")
-print(f"Edges: {graph.edges}")
+# 查看历史
+for snapshot in graph.get_state_history(config, limit=5):
+    print(f"Step: {snapshot.config['configurable']}")
+    print(f"Values: {snapshot.values}")
 ```
 
-#### 5. **添加日志和跟踪**
+#### 3. 添加日志和追踪
 
 ```python
 import logging
-from datetime import datetime
+from langchain_core.callbacks import LogCallbackHandler
 
 logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
-def my_node(state: State) -> dict:
-    logger.info(f"[{datetime.now()}] Entering my_node")
-    logger.debug(f"Input state: {state}")
-    
-    try:
-        result = process(state)
-        logger.info(f"my_node completed successfully")
-        return {"output": result}
-    except Exception as e:
-        logger.error(f"my_node failed: {e}", exc_info=True)
-        raise
+# 使用回调追踪执行
+handler = LogCallbackHandler()
 
-# 或使用LangSmith集成
-from langsmith import traceable
+config = {
+    "callbacks": [handler],
+    "configurable": {"thread_id": "debug_run"}
+}
 
-@traceable(name="my_node")
-def traced_node(state: State) -> dict:
-    # 自动记录到LangSmith
-    return process(state)
+result = graph.invoke(input, config=config)
+# 会打印详细的LLM调用信息
+```
+
+#### 4. 验证图的结构
+
+```python
+# 获取图的可视化
+graph.get_graph().draw_mermaid_dark()  # 生成mermaid图
+
+# 检查所有节点
+print(graph.nodes.keys())
+
+# 检查所有边
+print(graph.edges)
+
+# 检查条件分支
+print(graph.branches)
+
+# 验证state schema
+from langgraph.graph import StateGraph
+# 查看自动生成的channels
+compiled = graph.compile()
+print(compiled.channels)
 ```
 
 ---
@@ -1920,15 +1955,15 @@ graph LR
 sequenceDiagram
     participant User
     participant Pregel
-    participant Loop as SyncPregelLoop
-    participant Algo as _algo
+    participant SyncPregelLoop
+    participant Algo
     participant Channels
     participant Executor
     participant Node
     participant Checkpoint
     
     User->>Pregel: stream(input)
-    Pregel->>Loop: __enter__()
+    Pregel->>SyncPregelLoop: __enter__()
     Pregel->>Checkpoint: load_checkpoint()
     Checkpoint-->>Pregel: checkpoint
     
@@ -1936,32 +1971,48 @@ sequenceDiagram
     Pregel->>Algo: apply_input()
     Algo->>Channels: update(input_values)
     
-    Loop->>Algo: prepare_next_tasks()
-    Algo-->>Loop: tasks=[node1, node2]
-    
-    Loop->>Algo: should_interrupt()
-    alt interrupt
-        Loop-->>User: yield interrupt
-        User->>Loop: update_state()
-    else continue
-        Loop->>Executor: submit(node1)
-        Loop->>Executor: submit(node2)
-        
-        par Concurrent Execution
-            Executor->>Node: invoke(state)
-            Node-->>Executor: writes
-        end
-        
-        Executor-->>Loop: writes
-        Loop->>Algo: apply_writes()
-        Algo->>Channels: update(writes)
-        Algo->>Checkpoint: increment_versions()
-        
-        Loop-->>User: yield chunk
+    rect rgb(200, 220, 255)
+    note over SyncPregelLoop: Execute Loop (可能多次迭代)
+    SyncPregelLoop->>Algo: prepare_next_tasks()
+    Algo-->>SyncPregelLoop: tasks=[node1, node2]
     end
     
-    Loop->>Checkpoint: save_checkpoint()
-    Loop-->>Pregel: done
+    alt Has Tasks
+        rect rgb(220, 255, 220)
+        note over SyncPregelLoop: 检查中断
+        SyncPregelLoop->>Algo: should_interrupt()
+        end
+        
+        alt Need Interrupt
+            SyncPregelLoop-->>User: yield interrupt
+            User->>SyncPregelLoop: update_state()
+            SyncPregelLoop->>Algo: prepare_next_tasks()
+            Algo-->>SyncPregelLoop: updated tasks
+        else Continue Execution
+            SyncPregelLoop->>Executor: submit(node1)
+            SyncPregelLoop->>Executor: submit(node2)
+            
+            par Concurrent Task Execution
+                Executor->>Node: invoke(state)
+                Node-->>Executor: writes
+            and
+                Executor->>Node: invoke(state)
+                Node-->>Executor: writes
+            end
+            
+            SyncPregelLoop->>Algo: apply_writes()
+            Algo->>Channels: update(writes)
+            Algo->>Checkpoint: increment_versions()
+            
+            SyncPregelLoop-->>User: yield chunk
+            note over SyncPregelLoop: 返回循环继续准备下一轮任务
+        end
+    else No More Tasks
+        SyncPregelLoop->>Checkpoint: save_checkpoint()
+        Checkpoint-->>SyncPregelLoop: saved
+    end
+    
+    SyncPregelLoop-->>Pregel: done
     Pregel-->>User: final_result
 ```
 
@@ -2030,6 +2081,285 @@ graph TD
     style D fill:#f8bbd0
     style E fill:#d1c4e9
     style F fill:#b2dfdb
+```
+
+---
+
+## 性能优化和扩展指南
+
+### 性能优化建议
+
+#### 1. 并发度控制
+
+```python
+# 限制并发任务数量，避免资源溢出
+config = {
+    "configurable": {
+        "max_concurrency": 5  # 最多5个并发任务
+    }
+}
+
+for chunk in graph.stream(input, config=config):
+    process(chunk)
+
+# 对于I/O密集型（API调用），可以增大：
+config = {"configurable": {"max_concurrency": 20}}
+
+# 对于CPU密集型，应该等于CPU核心数：
+import multiprocessing
+config = {"configurable": {"max_concurrency": multiprocessing.cpu_count()}}
+```
+
+#### 2. Checkpoint持久化策略
+
+```python
+# 选择合适的durability模式
+compiled = graph.compile(
+    checkpointer=checkpointer,
+    durability="sync"  # 同步保存，每步后立即持久化（最安全，最慢）
+)
+
+compiled = graph.compile(
+    checkpointer=checkpointer,
+    durability="async"  # 异步保存，不阻塞执行（平衡方案）
+)
+
+compiled = graph.compile(
+    checkpointer=checkpointer,
+    durability="exit"  # 只在图退出时保存（最快，风险最高）
+)
+
+# 建议：生产环境使用"async"
+```
+
+#### 3. 流式处理 vs 批处理
+
+```python
+# ✅ 流式处理：实时获得结果，更快的用户反馈
+def process_streaming(graph, input_list):
+    for item in input_list:
+        for chunk in graph.stream(item, stream_mode="updates"):
+            # 立即处理中间结果
+            handle_chunk(chunk)
+
+# ❌ 批处理：等待所有结果，可能很慢
+def process_batch(graph, input_list):
+    results = []
+    for item in input_list:
+        result = graph.invoke(item)  # 阻塞调用
+        results.append(result)
+    return results
+
+# 性能对比：
+# 批处理：需要max(各项时间)
+# 流处理：可以边处理边输出，感觉更快
+```
+
+#### 4. 缓存和重用
+
+```python
+# 使用RunnableConfig的cache功能
+from langgraph.pregel._read import ChannelRead
+
+# 对于重复调用相同输入的节点，启用缓存
+def expensive_node(state):
+    # 这个操作很昂贵
+    return {"result": expensive_computation(state["query"])}
+
+# 添加缓存策略
+from langgraph.types import CachePolicy
+
+graph.add_node(
+    "expensive",
+    expensive_node,
+    cache_policy=CachePolicy(
+        max_size=100,  # 缓存最多100条
+        ttl=3600  # 1小时过期
+    )
+)
+```
+
+#### 5. 内存管理
+
+```python
+# 定期清理Checkpoint，避免数据库膨胀
+def cleanup_old_checkpoints(checkpointer, thread_id, days=30):
+    """删除超过N天的checkpoint"""
+    from datetime import datetime, timedelta
+    
+    cutoff = datetime.now() - timedelta(days=days)
+    
+    # 获取所有checkpoint
+    for snapshot in checkpointer.list(thread_id=thread_id):
+        if snapshot.metadata.get("ts") < cutoff:
+            checkpointer.delete(snapshot.config)
+
+# 定期运行清理
+import schedule
+schedule.every().day.at("02:00").do(
+    cleanup_old_checkpoints,
+    checkpointer,
+    thread_id="*",
+    days=30
+)
+```
+
+### 自定义扩展
+
+#### 1. 自定义Channel实现
+
+```python
+from langgraph.channels.base import BaseChannel
+from typing import Sequence, Any
+
+class CustomChannel(BaseChannel):
+    """自定义通道，存储最大N个值"""
+    
+    def __init__(self, typ, max_size=10):
+        self.typ = typ
+        self.max_size = max_size
+        self.values = []
+    
+    @property
+    def ValueType(self):
+        return list
+    
+    @property
+    def UpdateType(self):
+        return Any
+    
+    def get(self):
+        return self.values
+    
+    def update(self, values: Sequence[Any]) -> bool:
+        if not values:
+            return False
+        
+        self.values.extend(values)
+        # 保持最多max_size个值
+        if len(self.values) > self.max_size:
+            self.values = self.values[-self.max_size:]
+        
+        return True
+    
+    def from_checkpoint(self, checkpoint):
+        new_channel = self.__class__(self.typ, self.max_size)
+        new_channel.values = checkpoint if checkpoint else []
+        return new_channel
+    
+    def checkpoint(self):
+        return self.values
+
+# 使用自定义通道
+from langgraph.pregel import Pregel
+
+pregel = Pregel(
+    nodes=...,
+    channels={
+        "history": CustomChannel(list, max_size=20),
+        ...
+    }
+)
+```
+
+#### 2. 自定义Checkpointer
+
+```python
+from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
+
+class RedisCheckpointer(BaseCheckpointSaver):
+    """使用Redis存储checkpoint的实现"""
+    
+    def __init__(self, redis_client):
+        self.client = redis_client
+    
+    def put(self, config, checkpoint, metadata=None):
+        """保存checkpoint到Redis"""
+        key = f"checkpoint:{config['configurable']['thread_id']}"
+        import json
+        self.client.set(
+            key,
+            json.dumps({
+                "checkpoint": checkpoint,
+                "metadata": metadata
+            }),
+            ex=86400  # 24小时过期
+        )
+    
+    def get(self, config):
+        """从Redis加载checkpoint"""
+        key = f"checkpoint:{config['configurable']['thread_id']}"
+        import json
+        data = self.client.get(key)
+        if not data:
+            return None
+        
+        parsed = json.loads(data)
+        return CheckpointTuple(
+            checkpoint=parsed["checkpoint"],
+            metadata=parsed["metadata"]
+        )
+    
+    def list(self, config, **kwargs):
+        """列出所有checkpoint"""
+        pattern = f"checkpoint:{config['configurable']['thread_id']}:*"
+        keys = self.client.keys(pattern)
+        # 返回checkpoint列表...
+```
+
+#### 3. 自定义Node类型
+
+```python
+from langgraph.pregel._read import PregelNode
+from typing import Callable, Any
+
+class TransformNode:
+    """转换型节点，用于数据转换而不是业务逻辑"""
+    
+    def __init__(self, transform_fn: Callable[[Any], Any]):
+        self.transform_fn = transform_fn
+    
+    def __call__(self, state):
+        # 遍历所有状态字段，应用转换
+        return {
+            k: self.transform_fn(v)
+            for k, v in state.items()
+        }
+
+# 使用示例
+def uppercase_transform(value):
+    return value.upper() if isinstance(value, str) else value
+
+graph.add_node(
+    "uppercase_all",
+    TransformNode(uppercase_transform)
+)
+```
+
+#### 4. 自定义Stream模式
+
+```python
+# 为自定义处理定义stream callback
+def my_stream_handler(chunk):
+    """自定义的流处理"""
+    node, data = chunk
+    if node == "important_node":
+        send_to_webhook(data)  # 发送到外部系统
+    elif node == "error_node":
+        log_error(data)  # 记录错误
+
+# 在节点中使用
+def node_with_custom_stream(state, config):
+    writer = config["_write"]
+    
+    # 发送自定义消息到stream
+    writer(("my_node", "custom", {"status": "processing"}))
+    
+    result = do_work(state)
+    
+    writer(("my_node", "custom", {"status": "done", "result": result}))
+    
+    return {"output": result}
 ```
 
 ---
